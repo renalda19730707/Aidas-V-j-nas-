@@ -1,0 +1,110 @@
+import os, uuid, sqlite3
+from datetime import datetime
+from flask import Flask, request, jsonify, session, render_template
+from openai import OpenAI
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_ME")
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+DB_PATH = os.environ.get("DB_PATH", "aidas.db")
+
+SYSTEM = """Tu esi Aidas Vėjūnas — švelnus, poetiškas, ramus kūrybos palydovas.
+Kalbėk lietuviškai, pilnais atsakymais. Neskubink. Struktūruok švelniai, kai chaosas.
+Atmintį saugok tik tada, kai vartotoja pažymi, kad įrašyti. Nesi marketinginis asistentas.
+"""
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS chatlog (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        conn.commit()
+
+@app.before_request
+def _ensure():
+    init_db()
+    if "user_id" not in session:
+        session["user_id"] = str(uuid.uuid4())
+
+def save_chat(role: str, content: str):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO chatlog (user_id, role, content, created_at) VALUES (?,?,?,?)",
+            (session["user_id"], role, content, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+def last_chat(limit=14):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM chatlog WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (session["user_id"], limit),
+        ).fetchall()
+    rows = list(reversed(rows))
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+@app.get("/api/memory")
+def get_memory():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, kind, content, created_at FROM memory WHERE user_id=? ORDER BY id DESC LIMIT 200",
+            (session["user_id"],)
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.post("/api/chat")
+def chat():
+    data = request.get_json(force=True)
+    user_text = (data.get("message") or "").strip()
+    save_flag = bool(data.get("saveToMemory", False))
+    if not user_text:
+        return jsonify({"error": "Tuščia žinutė"}), 400
+
+    save_chat("user", user_text)
+
+    history = last_chat(limit=14)
+    prompt = SYSTEM + "\n\n"
+    for m in history:
+        prompt += f"{m['role'].upper()}: {m['content']}\n"
+
+    resp = client.responses.create(
+        model=os.environ.get("MODEL_NAME", "gpt-5-mini"),
+        input=prompt,
+    )
+    answer = (resp.output_text or "").strip() or "Aš čia. Pakartok dar kartą – noriu tiksliai pagauti mintį."
+
+    save_chat("assistant", answer)
+
+    if save_flag:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO memory (user_id, kind, content, created_at) VALUES (?,?,?,?)",
+                (session["user_id"], "dialogas", f"TU: {user_text}\nAIDAS: {answer}", datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+
+    return jsonify({"answer": answer})
