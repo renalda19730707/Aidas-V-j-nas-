@@ -108,3 +108,6 @@ def chat():
             conn.commit()
 
     return jsonify({"answer": answer})
+@programa.route("/")
+def home():
+    return "Aidas Vėjūnas gyvas 🌿"
